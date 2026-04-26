@@ -14,6 +14,7 @@ endpoint is never exposed directly.  This proxy sits on 0.0.0.0:CDP_PORT and:
 import os
 import re
 import socket
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.request import Request as URLRequest
@@ -52,19 +53,38 @@ def _pipe(src: socket.socket, dst: socket.socket) -> None:
 
 class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
+        # Healthz endpoint for Zeabur / readiness probes
+        if self.path == "/healthz":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"ok")
+            return
         if self.headers.get("Upgrade", "").lower() == "websocket":
             self._tunnel_ws()
         else:
             self._proxy_http()
 
     def _tunnel_ws(self) -> None:
-        chrome = socket.create_connection((CHROME_HOST, CHROME_PORT))
-        # Re-send request line + headers with Host rewritten to 127.0.0.1
-        raw = f"GET {self.path} HTTP/1.1\r\n"
-        for k, v in self.headers.items():
-            raw += f"Host: 127.0.0.1\r\n" if k.lower() == "host" else f"{k}: {v}\r\n"
-        raw += "\r\n"
-        chrome.sendall(raw.encode())
+        try:
+            chrome = socket.create_connection((CHROME_HOST, CHROME_PORT), timeout=5)
+        except Exception as exc:
+            print(f"[cdp_proxy] WS tunnel: Chrome connection failed: {exc}", flush=True)
+            self.send_error(503, "Chrome not reachable")
+            return
+
+        try:
+            # Re-send request line + headers with Host rewritten to 127.0.0.1
+            raw = f"GET {self.path} HTTP/1.1\r\n"
+            for k, v in self.headers.items():
+                raw += f"Host: 127.0.0.1\r\n" if k.lower() == "host" else f"{k}: {v}\r\n"
+            raw += "\r\n"
+            chrome.sendall(raw.encode())
+        except Exception as exc:
+            print(f"[cdp_proxy] WS tunnel: Failed to send request: {exc}", flush=True)
+            chrome.close()
+            self.send_error(502, "Failed to tunnel request")
+            return
 
         client = self.connection
         t1 = threading.Thread(target=_pipe, args=(client, chrome), daemon=True)
@@ -89,6 +109,7 @@ class _Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
         except Exception as exc:
+            print(f"[cdp_proxy] HTTP proxy failed for {self.path}: {exc}", flush=True)
             self.send_error(502, str(exc))
 
     def log_message(self, fmt, *args) -> None:  # silence access log
@@ -96,4 +117,9 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    HTTPServer(("0.0.0.0", PUBLIC_PORT), _Handler).serve_forever()
+    print(f"[cdp_proxy] Starting on 0.0.0.0:{PUBLIC_PORT}, chrome={CHROME_HOST}:{CHROME_PORT}, public_host={PUBLIC_HOST}", flush=True)
+    try:
+        HTTPServer(("0.0.0.0", PUBLIC_PORT), _Handler).serve_forever()
+    except Exception as exc:
+        print(f"[cdp_proxy] Server error: {exc}", flush=True)
+        sys.exit(1)

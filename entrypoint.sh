@@ -16,9 +16,13 @@ HEADLESS="${OPENCLAW_BROWSER_HEADLESS:-${MOLTBOT_BROWSER_HEADLESS:-${CLAWDBOT_BR
 # Defaults to the Zeabur internal DNS name; override with OPENCLAW_BROWSER_PUBLIC_HOST if needed.
 PUBLIC_HOST="${OPENCLAW_BROWSER_PUBLIC_HOST:-openclaw-sandbox-browser}"
 
+echo "[entrypoint] Starting browser sandbox on CDP_PORT=${CDP_PORT} PUBLIC_HOST=${PUBLIC_HOST} HEADLESS=${HEADLESS}"
+
 mkdir -p "${HOME}" "${HOME}/.chrome" "${XDG_CONFIG_HOME}" "${XDG_CACHE_HOME}"
 
+echo "[entrypoint] Starting Xvfb..."
 Xvfb :1 -screen 0 1280x800x24 -ac -nolisten tcp &
+sleep 0.5
 
 if [[ "${HEADLESS}" == "1" ]]; then
   CHROME_ARGS=(
@@ -50,24 +54,48 @@ CHROME_ARGS+=(
   "--no-sandbox"
 )
 
+echo "[entrypoint] Starting Chromium on internal port ${CHROME_CDP_PORT}..."
 chromium "${CHROME_ARGS[@]}" about:blank &
+CHROME_PID=$!
 
 for _ in $(seq 1 50); do
   if curl -sS --max-time 1 "http://127.0.0.1:${CHROME_CDP_PORT}/json/version" >/dev/null; then
+    echo "[entrypoint] Chromium ready (internal port ${CHROME_CDP_PORT})"
     break
   fi
   sleep 0.1
 done
 
-# Python CDP proxy: forwards requests to Chrome and rewrites ws://127.0.0.1 URLs
-# in JSON responses so that clients in other containers get a reachable WebSocket URL.
+echo "[entrypoint] Starting CDP proxy on port ${CDP_PORT}..."
 CDP_PORT="${CDP_PORT}" CHROME_CDP_INTERNAL_PORT="${CHROME_CDP_PORT}" \
   OPENCLAW_BROWSER_PUBLIC_HOST="${PUBLIC_HOST}" \
   python3 /usr/local/bin/cdp_proxy.py &
+PROXY_PID=$!
+
+# Wait for proxy to be ready before declaring startup complete
+echo "[entrypoint] Waiting for CDP proxy readiness..."
+PROXY_READY=0
+for _ in $(seq 1 30); do
+  if curl -sS --max-time 1 "http://127.0.0.1:${CDP_PORT}/healthz" 2>/dev/null | grep -q "ok"; then
+    echo "[entrypoint] CDP proxy ready on port ${CDP_PORT}"
+    PROXY_READY=1
+    break
+  fi
+  sleep 0.2
+done
+
+if [[ "${PROXY_READY}" == "0" ]]; then
+  echo "[entrypoint] WARNING: CDP proxy healthz not responding after 6s, continuing anyway..."
+fi
 
 if [[ "${ENABLE_NOVNC}" == "1" && "${HEADLESS}" != "1" ]]; then
+  echo "[entrypoint] Starting noVNC (VNC=${VNC_PORT} noVNC=${NOVNC_PORT})..."
   x11vnc -display :1 -rfbport "${VNC_PORT}" -shared -forever -nopw -localhost &
   websockify --web /usr/share/novnc/ "${NOVNC_PORT}" "localhost:${VNC_PORT}" &
 fi
 
+echo "[entrypoint] Startup complete. Chromium PID=${CHROME_PID} Proxy PID=${PROXY_PID}"
+
+# Wait for any child to exit; in normal operation this means we stay alive while Chromium runs
 wait -n
+echo "[entrypoint] A child process exited, terminating."
