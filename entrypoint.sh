@@ -22,7 +22,7 @@ mkdir -p "${HOME}" "${HOME}/.chrome" "${XDG_CONFIG_HOME}" "${XDG_CACHE_HOME}"
 
 echo "[entrypoint] Starting Xvfb..."
 Xvfb :1 -screen 0 1280x800x24 -ac -nolisten tcp &
-sleep 0.5
+sleep 1
 
 if [[ "${HEADLESS}" == "1" ]]; then
   CHROME_ARGS=(
@@ -71,6 +71,9 @@ CDP_PORT="${CDP_PORT}" CHROME_CDP_INTERNAL_PORT="${CHROME_CDP_PORT}" \
   OPENCLAW_BROWSER_PUBLIC_HOST="${PUBLIC_HOST}" \
   python3 /usr/local/bin/cdp_proxy.py &
 PROXY_PID=$!
+
+# Give proxy a moment to bind, then verify it responds
+sleep 0.5
 
 # Wait for proxy to be ready before declaring startup complete
 echo "[entrypoint] Waiting for CDP proxy readiness..."

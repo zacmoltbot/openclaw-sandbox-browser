@@ -16,6 +16,7 @@ import re
 import socket
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.request import Request as URLRequest
 from urllib.request import urlopen
@@ -27,6 +28,10 @@ PUBLIC_PORT = int(os.environ["CDP_PORT"])
 
 _WS_RE = re.compile(r'ws://127\.0\.0\.1(?::\d+)?/')
 
+# Track active tunnel count for observability
+_active_tunnels = 0
+_tunnel_lock = threading.Lock()
+
 
 def _rewrite(data: bytes) -> bytes:
     text = data.decode("utf-8", errors="replace")
@@ -34,7 +39,8 @@ def _rewrite(data: bytes) -> bytes:
     return text.encode("utf-8")
 
 
-def _pipe(src: socket.socket, dst: socket.socket) -> None:
+def _pipe(src: socket.socket, dst: socket.socket, label: str) -> None:
+    """Bidirectional pipe between src and dst. Logs disconnection."""
     try:
         while True:
             chunk = src.recv(65536)
@@ -43,56 +49,90 @@ def _pipe(src: socket.socket, dst: socket.socket) -> None:
             dst.sendall(chunk)
     except OSError:
         pass
+    except Exception as exc:
+        print(f"[cdp_proxy][pipe:{label}] Error: {exc}", flush=True)
     finally:
         for s in (src, dst):
             try:
-                s.shutdown(socket.SHUT_WR)
+                s.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
 
 
 class _Handler(BaseHTTPRequestHandler):
+    server_version = "CDP-Proxy/1.0"
+
     def do_GET(self) -> None:
-        # Healthz endpoint for Zeabur / readiness probes
         if self.path == "/healthz":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"ok")
-            return
-        if self.headers.get("Upgrade", "").lower() == "websocket":
+            self._healthz()
+        elif self.headers.get("Upgrade", "").lower() == "websocket":
             self._tunnel_ws()
         else:
             self._proxy_http()
 
-    def _tunnel_ws(self) -> None:
+    def _healthz(self) -> None:
+        """Readiness probe: checks that Chrome is reachable."""
         try:
-            chrome = socket.create_connection((CHROME_HOST, CHROME_PORT), timeout=5)
+            url = f"http://{CHROME_HOST}:{CHROME_PORT}/json/version"
+            with urlopen(url, timeout=3) as resp:
+                if resp.status == 200:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.end_headers()
+                    self.wfile.write(b"ok")
+                    return
+        except Exception:
+            pass
+        self.send_error(503, "Chrome not reachable")
+
+    def _tunnel_ws(self) -> None:
+        global _active_tunnels
+        tunnel_id = id(self)
+        print(f"[cdp_proxy][ws:{tunnel_id}] Opening tunnel to {CHROME_HOST}:{CHROME_PORT}", flush=True)
+
+        try:
+            chrome = socket.create_connection((CHROME_HOST, CHROME_PORT), timeout=10)
         except Exception as exc:
-            print(f"[cdp_proxy] WS tunnel: Chrome connection failed: {exc}", flush=True)
+            print(f"[cdp_proxy][ws:{tunnel_id}] Chrome connection failed: {exc}", flush=True)
             self.send_error(503, "Chrome not reachable")
             return
 
         try:
-            # Re-send request line + headers with Host rewritten to 127.0.0.1
             raw = f"GET {self.path} HTTP/1.1\r\n"
             for k, v in self.headers.items():
                 raw += f"Host: 127.0.0.1\r\n" if k.lower() == "host" else f"{k}: {v}\r\n"
             raw += "\r\n"
             chrome.sendall(raw.encode())
         except Exception as exc:
-            print(f"[cdp_proxy] WS tunnel: Failed to send request: {exc}", flush=True)
+            print(f"[cdp_proxy][ws:{tunnel_id}] Failed to send request to Chrome: {exc}", flush=True)
             chrome.close()
             self.send_error(502, "Failed to tunnel request")
             return
 
         client = self.connection
-        t1 = threading.Thread(target=_pipe, args=(client, chrome), daemon=True)
-        t2 = threading.Thread(target=_pipe, args=(chrome, client), daemon=True)
-        t1.start()
-        t2.start()
-        t1.join()
-        t2.join()
+        client.setblocking(False)
+        chrome.setblocking(False)
+
+        with _tunnel_lock:
+            _active_tunnels += 1
+            count = _active_tunnels
+        print(f"[cdp_proxy][ws:{tunnel_id}] Tunnel open (active={count})", flush=True)
+
+        try:
+            t1 = threading.Thread(target=_pipe, args=(client, chrome, f"{tunnel_id}-c2s"), daemon=True)
+            t2 = threading.Thread(target=_pipe, args=(chrome, client, f"{tunnel_id}-s2c"), daemon=True)
+            t1.start()
+            t2.start()
+            t1.join()
+            t2.join()
+        finally:
+            with _tunnel_lock:
+                _active_tunnels -= 1
+            try:
+                chrome.close()
+            except OSError:
+                pass
+            print(f"[cdp_proxy][ws:{tunnel_id}] Tunnel closed (active={_active_tunnels})", flush=True)
 
     def _proxy_http(self) -> None:
         url = f"http://{CHROME_HOST}:{CHROME_PORT}{self.path}"
@@ -109,17 +149,34 @@ class _Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
         except Exception as exc:
-            print(f"[cdp_proxy] HTTP proxy failed for {self.path}: {exc}", flush=True)
+            print(f"[cdp_proxy][http] Proxy failed for {self.path}: {exc}", flush=True)
             self.send_error(502, str(exc))
 
-    def log_message(self, fmt, *args) -> None:  # silence access log
+    def log_message(self, fmt, *args) -> None:
+        # silenced; noise in tunnel mode
         pass
 
 
+class _ThreadedHTTPServer(HTTPServer):
+    """HTTPServer subclass that handles each request in a new thread."""
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, socket.error):
+            # Broken pipe / client disconnected — not worth logging
+            pass
+        else:
+            print(f"[cdp_proxy][server] Error: {exc}", flush=True)
+
+
 if __name__ == "__main__":
-    print(f"[cdp_proxy] Starting on 0.0.0.0:{PUBLIC_PORT}, chrome={CHROME_HOST}:{CHROME_PORT}, public_host={PUBLIC_HOST}", flush=True)
+    print(f"[cdp_proxy] Starting threaded server on 0.0.0.0:{PUBLIC_PORT}, "
+          f"chrome={CHROME_HOST}:{CHROME_PORT}, public_host={PUBLIC_HOST}", flush=True)
+    server = _ThreadedHTTPServer(("0.0.0.0", PUBLIC_PORT), _Handler)
+    server.timeout = None  # serveforever without blocking handle_error
     try:
-        HTTPServer(("0.0.0.0", PUBLIC_PORT), _Handler).serve_forever()
-    except Exception as exc:
-        print(f"[cdp_proxy] Server error: {exc}", flush=True)
-        sys.exit(1)
+        server.serve_forever()
+    except KeyboardInterrupt:
+        server.shutdown()
