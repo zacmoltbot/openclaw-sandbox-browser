@@ -52,6 +52,13 @@ CHROME_ARGS+=(
   "--disable-crash-reporter"
   "--metrics-recording-only"
   "--no-sandbox"
+  "--disable-extensions"
+  "--disable-background-timer-throttling"
+  "--disable-backgrounding-occluded-windows"
+  "--disable-renderer-backgrounding"
+  "--disable-partial-ras"
+  "--enable-logging=stderr"
+  "--v=1"
 )
 
 echo "[entrypoint] Starting Chromium on internal port ${CHROME_CDP_PORT}..."
@@ -98,6 +105,19 @@ if [[ "${ENABLE_NOVNC}" == "1" && "${HEADLESS}" != "1" ]]; then
 fi
 
 echo "[entrypoint] Startup complete. Chromium PID=${CHROME_PID} Proxy PID=${PROXY_PID}"
+
+# Periodic resource monitor: log memory pressure to help diagnose screenshot failures
+(while true; do
+  MEM_TOTAL=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+  MEM_AVAILABLE=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
+  MEM_FREE=$(grep MemFree /proc/meminfo | awk '{print $2}')
+  if [[ -n "$MEM_AVAILABLE" && -n "$MEM_TOTAL" ]]; then
+    PCT_AVAILABLE=$((MEM_AVAILABLE * 100 / MEM_TOTAL))
+    echo "[entrypoint][monitor] mem_avail=${MEM_AVAILABLE}KB mem_free=${MEM_FREE}KB (${PCT_AVAILABLE}% free)" >&2
+  fi
+  sleep 30
+done) &
+MONITOR_PID=$!
 
 # Wait for any child to exit; in normal operation this means we stay alive while Chromium runs
 wait -n

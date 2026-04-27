@@ -41,8 +41,14 @@ def _rewrite(data: bytes) -> bytes:
 
 def _pipe(src: socket.socket, dst: socket.socket, label: str) -> None:
     """Bidirectional pipe between src and dst. Logs disconnection."""
+    import select
     try:
         while True:
+            # Wait for src to have data before reading (handles non-blocking mode correctly)
+            r, _, _ = select.select([src], [], [], 0.5)
+            if not r:
+                # Timeout: check if sockets are still connected
+                continue
             chunk = src.recv(65536)
             if not chunk:
                 break
