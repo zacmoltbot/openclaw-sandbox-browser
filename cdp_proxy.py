@@ -16,10 +16,11 @@ import datetime
 import os
 import re
 import socket
+import subprocess
 import sys
 import threading
-import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
 from urllib.request import Request as URLRequest
 from urllib.request import urlopen
 
@@ -27,18 +28,22 @@ CHROME_HOST = "127.0.0.1"
 CHROME_PORT = int(os.environ["CHROME_CDP_INTERNAL_PORT"])
 PUBLIC_HOST = os.environ.get("OPENCLAW_BROWSER_PUBLIC_HOST", "openclaw-sandbox-browser")
 PUBLIC_PORT = int(os.environ["CDP_PORT"])
+HTTP_PROXY_TIMEOUT = float(os.environ.get("CDP_PROXY_HTTP_TIMEOUT", "10"))
+HEALTHCHECK_TIMEOUT = float(os.environ.get("CDP_PROXY_HEALTHCHECK_TIMEOUT", "3"))
+WS_CONNECT_TIMEOUT = float(os.environ.get("CDP_PROXY_WS_CONNECT_TIMEOUT", "10"))
+WS_IDLE_LOG_INTERVAL = int(os.environ.get("CDP_PROXY_WS_IDLE_LOG_INTERVAL", "20"))
+WS_SEND_TIMEOUT = float(os.environ.get("CDP_PROXY_WS_SEND_TIMEOUT", "30"))
 
 # Runtime fingerprint — populated at startup for positive identification
 try:
-    import subprocess
-    _GIT_SHA    = subprocess.check_output(
+    _GIT_SHA = subprocess.check_output(
         ["git", "rev-parse", "--short=8", "HEAD"],
         stderr=subprocess.DEVNULL).strip().decode()
     _GIT_BRANCH = subprocess.check_output(
         ["git", "rev-parse", "--abbrev-ref", "HEAD"],
         stderr=subprocess.DEVNULL).strip().decode()
 except Exception:
-    _GIT_SHA    = "unknown"
+    _GIT_SHA = "unknown"
     _GIT_BRANCH = "unknown"
 
 _RUNTIME_FINGERPRINT = (
@@ -65,67 +70,65 @@ def _rewrite(data: bytes) -> bytes:
     return text.encode("utf-8")
 
 
-def _pipe(src: socket.socket, dst: socket.socket, label: str) -> None:
-    """Bidirectional pipe between src and dst. Logs disconnection and timeouts."""
-    import select
-    select_timeouts = 0
-    select_lock = threading.Lock()
+def _close_socket(sock: socket.socket) -> None:
     try:
-        while True:
-            r, _, _ = select.select([src], [], [], 0.5)
-            if not r:
-                select_timeouts += 1
-                if select_timeouts % 20 == 0:  # log every 10s of idle
-                    print(f"[cdp_proxy][pipe:{label}] select timeout #{select_timeouts} "
-                          f"(idle {select_timeouts * 0.5:.0f}s) "
-                          f"src_so={src.getsockname()} dst_so={dst.getsockname()}",
-                          flush=True)
-                continue
-            select_timeouts = 0
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+def _pipe(src: socket.socket, dst: socket.socket, label: str, stop: threading.Event) -> None:
+    """Bidirectional pipe between src and dst with bounded send blocking."""
+    idle_ticks = 0
+    try:
+        while not stop.is_set():
             try:
                 chunk = src.recv(65536)
-            except BlockingIOError:
-                # Non-blocking recv with no data — should not happen after select
+            except socket.timeout:
+                idle_ticks += 1
+                if idle_ticks % WS_IDLE_LOG_INTERVAL == 0:
+                    print(
+                        f"[cdp_proxy][pipe:{label}] recv timeout #{idle_ticks} "
+                        f"(idle {idle_ticks:.0f}s) t={_now()}",
+                        flush=True,
+                    )
                 continue
+            except BlockingIOError:
+                continue
+
+            idle_ticks = 0
             if not chunk:
                 print(f"[cdp_proxy][pipe:{label}] EOF received, closing", flush=True)
                 break
+
             try:
                 dst.sendall(chunk)
+            except socket.timeout:
+                print(
+                    f"[cdp_proxy][pipe:{label}] send timeout after {WS_SEND_TIMEOUT}s, closing "
+                    f"t={_now()}",
+                    flush=True,
+                )
+                break
             except BlockingIOError:
-                # Kernel send buffer full —短暂背压；继续尝试
-                try:
-                    import select as _s
-                    while True:
-                        _, w, _ = _s.select([], [dst], [], 0.5)
-                        if w:
-                            try:
-                                dst.sendall(chunk)
-                                break
-                            except BlockingIOError:
-                                pass
-                        else:
-                            select_timeouts += 1
-                            if select_timeouts % 10 == 0:
-                                print(f"[cdp_proxy][pipe:{label}] send buffer full "
-                                      f"for {select_timeouts * 0.5:.0f}s, still trying",
-                                      flush=True)
-                finally:
-                    del _s
+                print(f"[cdp_proxy][pipe:{label}] unexpected non-blocking send stall", flush=True)
+                break
     except OSError as exc:
         print(f"[cdp_proxy][pipe:{label}] OSError: {exc}", flush=True)
     except Exception as exc:
         print(f"[cdp_proxy][pipe:{label}] Error: {exc}", flush=True)
     finally:
-        for s in (src, dst):
-            try:
-                s.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
+        stop.set()
+        _close_socket(src)
+        _close_socket(dst)
 
 
 class _Handler(BaseHTTPRequestHandler):
-    server_version = "CDP-Proxy/1.0"
+    server_version = "CDP-Proxy/1.1"
 
     def do_GET(self) -> None:
         if self.path == "/healthz":
@@ -139,32 +142,36 @@ class _Handler(BaseHTTPRequestHandler):
         """Readiness probe: checks that Chrome is reachable."""
         try:
             url = f"http://{CHROME_HOST}:{CHROME_PORT}/json/version"
-            with urlopen(url, timeout=3) as resp:
+            with urlopen(url, timeout=HEALTHCHECK_TIMEOUT) as resp:
                 if resp.status == 200:
+                    body = f"ok active_tunnels={_active_tunnels}\n".encode()
                     self.send_response(200)
                     self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
-                    self.wfile.write(b"ok")
+                    self.wfile.write(body)
                     return
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[cdp_proxy][healthz] FAIL: {exc} t={_now()}", flush=True)
         self.send_error(503, "Chrome not reachable")
 
     def _tunnel_ws(self) -> None:
         global _active_tunnels
         tunnel_id = f"{os.getpid()}-{id(self) & 0xFFFFFF:06x}"
-        ws_path   = self.path          # e.g. /devtools/browser/... or /devtools/page/...
-        ws_type   = "browser" if "/browser/" in ws_path else "page" if "/page/" in ws_path else "unknown"
+        ws_path = self.path
+        ws_type = "browser" if "/browser/" in ws_path else "page" if "/page/" in ws_path else "unknown"
 
-        print(f"[cdp_proxy][ws:{tunnel_id}] UPGRADE_REQUEST path={ws_path} "
-              f"type={ws_type} client={self.client_address} "
-              f"t={_now()}", flush=True)
+        print(
+            f"[cdp_proxy][ws:{tunnel_id}] UPGRADE_REQUEST path={ws_path} "
+            f"type={ws_type} client={self.client_address} "
+            f"t={_now()}",
+            flush=True,
+        )
 
         try:
-            chrome = socket.create_connection((CHROME_HOST, CHROME_PORT), timeout=10)
+            chrome = socket.create_connection((CHROME_HOST, CHROME_PORT), timeout=WS_CONNECT_TIMEOUT)
         except Exception as exc:
-            print(f"[cdp_proxy][ws:{tunnel_id}] CHROME_CONNECT_FAIL: {exc} "
-                  f"t={_now()}", flush=True)
+            print(f"[cdp_proxy][ws:{tunnel_id}] CHROME_CONNECT_FAIL: {exc} t={_now()}", flush=True)
             self.send_error(503, "Chrome not reachable")
             return
 
@@ -175,43 +182,45 @@ class _Handler(BaseHTTPRequestHandler):
             raw += "\r\n"
             chrome.sendall(raw.encode())
         except Exception as exc:
-            print(f"[cdp_proxy][ws:{tunnel_id}] SEND_REQUEST_FAIL: {exc} "
-                  f"t={_now()}", flush=True)
-            chrome.close()
+            print(f"[cdp_proxy][ws:{tunnel_id}] SEND_REQUEST_FAIL: {exc} t={_now()}", flush=True)
+            _close_socket(chrome)
             self.send_error(502, "Failed to tunnel request")
             return
 
         client = self.connection
-        client.setblocking(False)
-        chrome.setblocking(False)
+        client.settimeout(1.0)
+        chrome.settimeout(1.0)
 
         with _tunnel_lock:
             _active_tunnels += 1
             count = _active_tunnels
 
-        print(f"[cdp_proxy][ws:{tunnel_id}] TUNNEL_OPEN "
-              f"type={ws_type} active={count} t={_now()}", flush=True)
+        print(f"[cdp_proxy][ws:{tunnel_id}] TUNNEL_OPEN type={ws_type} active={count} t={_now()}", flush=True)
 
+        stop = threading.Event()
         try:
-            t1 = threading.Thread(target=_pipe,
-                                  args=(client, chrome, f"{tunnel_id}-c2s"),
-                                  daemon=True)
-            t2 = threading.Thread(target=_pipe,
-                                  args=(chrome, client, f"{tunnel_id}-s2c"),
-                                  daemon=True)
+            t1 = threading.Thread(
+                target=_pipe,
+                args=(client, chrome, f"{tunnel_id}-c2s", stop),
+                daemon=True,
+            )
+            t2 = threading.Thread(
+                target=_pipe,
+                args=(chrome, client, f"{tunnel_id}-s2c", stop),
+                daemon=True,
+            )
             t1.start()
             t2.start()
             t1.join()
             t2.join()
         finally:
+            stop.set()
             with _tunnel_lock:
                 _active_tunnels -= 1
-            try:
-                chrome.close()
-            except OSError:
-                pass
-            print(f"[cdp_proxy][ws:{tunnel_id}] TUNNEL_CLOSE "
-                  f"active={_active_tunnels} t={_now()}", flush=True)
+                count = _active_tunnels
+            _close_socket(chrome)
+            _close_socket(client)
+            print(f"[cdp_proxy][ws:{tunnel_id}] TUNNEL_CLOSE active={count} t={_now()}", flush=True)
 
     def _proxy_http(self) -> None:
         """HTTP proxy: forward to Chrome, rewrite ws:// URLs in JSON bodies.
@@ -226,28 +235,28 @@ class _Handler(BaseHTTPRequestHandler):
         url = f"http://{CHROME_HOST}:{CHROME_PORT}{self.path}"
         req = URLRequest(url, headers={"Host": "127.0.0.1"})
         try:
-            with urlopen(req, timeout=10) as resp:
+            with urlopen(req, timeout=HTTP_PROXY_TIMEOUT) as resp:
                 body = resp.read()
                 ct = resp.headers.get("Content-Type", "")
-                # Rewrite ws:// URLs for any /json/* path or any JSON content type
-                rewrite = (self.path.startswith("/json/")
-                           or "json" in ct.lower())
+                rewrite = self.path.startswith("/json/") or "json" in ct.lower()
                 if rewrite:
                     body = _rewrite(body)
                     rewrote = "rewritten"
                 else:
                     rewrote = "skipped"
-                self.send_response(200)
+                self.send_response(resp.status)
                 self.send_header("Content-Type", ct)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
-                print(f"[cdp_proxy][http] {resp.status} {self.path} "
-                      f"ct={ct!r} rewrite={rewrote} size={len(body)} "
-                      f"t={_now()}", flush=True)
+                print(
+                    f"[cdp_proxy][http] {resp.status} {self.path} "
+                    f"ct={ct!r} rewrite={rewrote} size={len(body)} "
+                    f"t={_now()}",
+                    flush=True,
+                )
         except Exception as exc:
-            print(f"[cdp_proxy][http] PROXY_FAIL {self.path}: {exc} "
-                  f"t={_now()}", flush=True)
+            print(f"[cdp_proxy][http] PROXY_FAIL {self.path}: {exc} t={_now()}", flush=True)
             self.send_error(502, str(exc))
 
     def log_message(self, fmt, *args) -> None:
@@ -255,8 +264,9 @@ class _Handler(BaseHTTPRequestHandler):
         pass
 
 
-class _ThreadedHTTPServer(HTTPServer):
-    """HTTPServer subclass that handles each request in a new thread."""
+class _ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """HTTP server that handles each request in a separate daemon thread."""
+
     daemon_threads = True
     allow_reuse_address = True
 
@@ -270,11 +280,16 @@ class _ThreadedHTTPServer(HTTPServer):
 
 
 if __name__ == "__main__":
-    print(f"[cdp_proxy] === STARTUP { _RUNTIME_FINGERPRINT} ===", flush=True)
-    print(f"[cdp_proxy] Starting threaded server on 0.0.0.0:{PUBLIC_PORT}, "
-          f"chrome={CHROME_HOST}:{CHROME_PORT}, public_host={PUBLIC_HOST}", flush=True)
+    print(f"[cdp_proxy] === STARTUP {_RUNTIME_FINGERPRINT} ===", flush=True)
+    print(
+        f"[cdp_proxy] Starting threaded server on 0.0.0.0:{PUBLIC_PORT}, "
+        f"chrome={CHROME_HOST}:{CHROME_PORT}, public_host={PUBLIC_HOST}, "
+        f"http_timeout={HTTP_PROXY_TIMEOUT}s healthz_timeout={HEALTHCHECK_TIMEOUT}s "
+        f"ws_connect_timeout={WS_CONNECT_TIMEOUT}s ws_send_timeout={WS_SEND_TIMEOUT}s",
+        flush=True,
+    )
     server = _ThreadedHTTPServer(("0.0.0.0", PUBLIC_PORT), _Handler)
-    server.timeout = None  # serveforever without blocking handle_error
+    server.timeout = None
     try:
         server.serve_forever()
     except KeyboardInterrupt:
